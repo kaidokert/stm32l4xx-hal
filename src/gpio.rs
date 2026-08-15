@@ -22,6 +22,20 @@ pub trait GpioExt {
 
     /// Splits the GPIO block into independent pins and registers
     fn split(self, ahb: &mut AHB2) -> Self::Parts;
+
+    /// Splits the GPIO block into independent pins **without touching RCC**.
+    ///
+    /// # Safety
+    ///
+    /// The GPIO port clock must already be enabled (via RCC AHB2ENR) from a
+    /// privileged context — e.g. by the kernel before it hands the port to a
+    /// partition and arms the MPU. `split` enables/resets the clock through
+    /// `cortex_m::bb` bit-band writes to RCC; under MPU enforcement with a
+    /// deny-all background region those fault (MemManage DACCVIOL) unless the
+    /// bit-band alias and RCC are in the partition's `peripheral_regions` grant.
+    /// This variant skips them so an MPU-isolated partition can obtain typed pin
+    /// handles for a port whose clock is already on.
+    unsafe fn split_unchecked(self) -> Self::Parts;
 }
 
 /// Input mode (type state)
@@ -291,6 +305,11 @@ macro_rules! gpio {
                     <$GPIOX>::reset(ahb);
                     $($pwrenable)?
 
+                    // Safety: the port clock was just enabled above.
+                    unsafe { self.split_unchecked() }
+                }
+
+                unsafe fn split_unchecked(self) -> Parts {
                     Parts {
                         afrh: Afr::new(),
                         afrl: Afr::new(),

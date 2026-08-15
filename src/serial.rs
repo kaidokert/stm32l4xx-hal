@@ -257,11 +257,32 @@ macro_rules! hal {
                 where
                     PINS: Pins<pac::$USARTX>,
                 {
-                    let config = config.into();
-
                     // enable or reset $USARTX
                     <pac::$USARTX>::enable(apb);
                     <pac::$USARTX>::reset(apb);
+                    // Safety: the USART clock was just enabled above.
+                    unsafe { Self::new_unchecked(usart, pins, config, clocks) }
+                }
+
+                /// Like [`Self::$usartX`] but **without touching RCC** — skips the
+                /// clock enable/reset (bit-band writes to RCC that fault under MPU
+                /// enforcement with a deny-all background region). For an
+                /// MPU-isolated partition whose USART clock the kernel already
+                /// enabled from privileged context.
+                ///
+                /// # Safety
+                ///
+                /// The USART peripheral clock must already be enabled via RCC.
+                pub unsafe fn new_unchecked(
+                    usart: pac::$USARTX,
+                    pins: PINS,
+                    config: impl Into<Config>,
+                    clocks: Clocks,
+                ) -> Self
+                where
+                    PINS: Pins<pac::$USARTX>,
+                {
+                    let config = config.into();
 
                     // Reset other registers to disable advanced USART features
                     usart.cr1.reset();
