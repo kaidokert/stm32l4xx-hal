@@ -39,7 +39,10 @@ pub enum Error {
     Nack,
     // Overrun, // slave mode only
     // Pec, // SMBUS mode only
-    // Timeout, // SMBUS mode only
+    /// A bounded wait for a bus event expired (for example SDA or SCL held low, which
+    /// raises neither a bus error nor a NACK). The peripheral has been software-reset
+    /// and is ready for the next transfer.
+    Timeout,
     // Alert, // SMBUS mode only
 }
 
@@ -271,8 +274,42 @@ macro_rules! flush_txdr {
     };
 }
 
+/// Polling iterations one wait for a bus event may spend before failing with
+/// `Error::Timeout`. There is no timer here, so the bound is a loop count: one
+/// iteration is a register read and a few compares, a few million per second at the
+/// fastest L4 core clock (120 MHz). That makes the bound well over 100 ms at any
+/// supported clock, while one byte at 100 kHz takes ~0.1 ms and even SMBus-length
+/// (25 ms) clock stretching stays far inside it. Slower clocks only lengthen the bound.
+const BUSY_WAIT_BUDGET: u32 = 1_000_000;
+
+/// Reads of CR1 that `software_reset!` makes while PE is low. Each read is a complete APB
+/// transfer, lasting at least one APB clock cycle, so this covers the minimum PE low time.
+const PE_LOW_MIN_READS: u32 = 3;
+
+/// Cap on CR1 reads while waiting for PE to read back 0.
+const PE_RESET_BUDGET: u32 = 100;
+
+/// Software reset (RM0351/RM0394 "Software reset"): PE must stay low for at least 3 APB clock
+/// cycles, guaranteed by writing PE=0, reading until PE reads back 0 on at least the
+/// `PE_LOW_MIN_READS`th read, then writing PE=1. If the cap is reached PE is set anyway;
+/// the caller is already reporting `Error::Timeout`. Clears the transfer state (CR2
+/// START/STOP, ISR BUSY and event flags) and keeps the configuration.
+macro_rules! software_reset {
+    ($i2c:expr) => {
+        $i2c.cr1.modify(|_, w| w.pe().clear_bit());
+        for reads in 1..=PE_RESET_BUDGET {
+            let pe_low = $i2c.cr1.read().pe().bit_is_clear();
+            if pe_low && reads >= PE_LOW_MIN_READS {
+                break;
+            }
+        }
+        $i2c.cr1.modify(|_, w| w.pe().set_bit());
+    };
+}
+
 macro_rules! busy_wait {
     ($i2c:expr, $flag:ident, $variant:ident) => {
+        let mut budget = BUSY_WAIT_BUDGET;
         loop {
             let isr = $i2c.isr.read();
 
@@ -288,9 +325,28 @@ macro_rules! busy_wait {
                 $i2c.icr.write(|w| w.stopcf().set_bit().nackcf().set_bit());
                 flush_txdr!($i2c);
                 return Err(Error::Nack);
+            } else if budget == 0 {
+                software_reset!($i2c);
+                return Err(Error::Timeout);
             } else {
-                // try again
+                budget -= 1;
             }
+        }
+    };
+}
+
+/// Wait for any previous address sequence to end automatically. This could be up to
+/// 50% of a bus cycle (ie. up to 0.5/freq), but START stays set while the bus is held
+/// busy, so the wait is bounded like `busy_wait!`.
+macro_rules! wait_start_cleared {
+    ($i2c:expr) => {
+        let mut budget = BUSY_WAIT_BUDGET;
+        while $i2c.cr2.read().start().bit_is_set() {
+            if budget == 0 {
+                software_reset!($i2c);
+                return Err(Error::Timeout);
+            }
+            budget -= 1;
         }
     };
 }
@@ -305,10 +361,7 @@ where
         // TODO support transfers of more than 255 bytes
         assert!(bytes.len() < 256);
 
-        // Wait for any previous address sequence to end
-        // automatically. This could be up to 50% of a bus
-        // cycle (ie. up to 0.5/freq)
-        while self.i2c.cr2.read().start().bit_is_set() {}
+        wait_start_cleared!(self.i2c);
 
         // Set START and prepare to send `bytes`. The
         // START bit can be set even if the bus is BUSY or
@@ -359,10 +412,7 @@ where
         // TODO support transfers of more than 255 bytes
         assert!(buffer.len() < 256 && buffer.len() > 0);
 
-        // Wait for any previous address sequence to end
-        // automatically. This could be up to 50% of a bus
-        // cycle (ie. up to 0.5/freq)
-        while self.i2c.cr2.read().start().bit_is_set() {}
+        wait_start_cleared!(self.i2c);
 
         // Set START and prepare to receive bytes into
         // `buffer`. The START bit can be set even if the bus
@@ -405,10 +455,7 @@ where
         assert!(bytes.len() < 256 && bytes.len() > 0);
         assert!(buffer.len() < 256 && buffer.len() > 0);
 
-        // Wait for any previous address sequence to end
-        // automatically. This could be up to 50% of a bus
-        // cycle (ie. up to 0.5/freq)
-        while self.i2c.cr2.read().start().bit_is_set() {}
+        wait_start_cleared!(self.i2c);
 
         // Set START and prepare to send `bytes`. The
         // START bit can be set even if the bus is BUSY or
